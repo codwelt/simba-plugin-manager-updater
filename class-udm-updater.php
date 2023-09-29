@@ -6,10 +6,10 @@ if (!defined('ABSPATH')) die('No direct access.');
 Licence: MIT / GPLv2+
 */
 
-if (!class_exists('Updraft_Manager_Updater_1_8')):
-class Updraft_Manager_Updater_1_8 {
+if (!class_exists('Updraft_Manager_Updater_1_9')):
+class Updraft_Manager_Updater_1_9 {
 
-	public $version = '1.8.11';
+	public $version = '1.9.0';
 
 	public $relative_plugin_file;
 	public $slug;
@@ -35,6 +35,12 @@ class Updraft_Manager_Updater_1_8 {
 	public $require_login = true;
 	
 	private $plugin_data = null;
+
+	private $ourdir;
+
+	private $plugin_file;
+	
+	private $connector_footer_added = false;
 
 	/**
 	 * Constructor
@@ -103,6 +109,46 @@ class Updraft_Manager_Updater_1_8 {
 		if (version_compare($wp_version, '5.5', '<')) {
 			add_filter('auto_update_plugin', array($this, 'auto_update_plugin'), 20, 2);
 		}
+
+		add_action('wp_loaded', array($this, 'maybe_force_checking_for_updates'));
+	}
+
+	/**
+	 * Whether to manually force checking for updates by inspecting a specified slug submitted as a query argument (force_udm_check) and build restriction where plugin can only be force checked 2 times a day to prevent abuse
+	 *
+	 * @return Void
+	 */
+	public function maybe_force_checking_for_updates() {
+		if (!isset($_REQUEST['force_udm_check']) || '' === $_REQUEST['force_udm_check']) return;
+		$slug = sanitize_text_field($_REQUEST['force_udm_check']);
+		if ($this->slug !== $slug) return;
+		header('Content-type: application/json');
+		$restriction = $this->get_option('udm_manual_check_for_updates_restriction');
+		if (!is_array($restriction)) $restriction = array();
+		$time_now = time();
+		$wp_current_day = $time_now - ($time_now % 86400);
+		if (!isset($restriction[$slug]) || !isset($restriction[$slug]['current_day']) || !is_numeric($restriction[$slug]['current_day']) || !isset($restriction[$slug]['count']) || !is_numeric($restriction[$slug]['count']) || $restriction[$slug]['current_day'] > $wp_current_day || $wp_current_day - $restriction[$slug]['current_day'] > 60*60*24) {
+			// If the restriction option doesn't exist, doesn't have a value, has expired, has invalid data type, one of the required variables doesn't exist, or current day doesn't match with what's in the data then set a new one
+			$restriction[$slug] = array(
+				'current_day' => $wp_current_day,
+				'count' => 1
+			);
+		} elseif ($wp_current_day == $restriction[$slug]['current_day'] && (int) $restriction[$slug]['count'] < 2) {
+			$restriction[$slug]['count'] = 2;
+		} else {
+			echo json_encode(array(
+				'code' => 'force_checking_limit_exceeded',
+				'data' => $restriction[$slug]['count'],
+			));
+			exit;
+		}
+		$this->update_option('udm_manual_check_for_updates_restriction', $restriction);
+		$this->plug_updatechecker->checkForUpdates();
+		echo json_encode(array(
+			'code' => 'success',
+			'data' => $restriction[$slug]['count'],
+		));
+		exit;
 	}
 
 	/**
@@ -168,7 +214,7 @@ class Updraft_Manager_Updater_1_8 {
 		// Over-ride update mechanism for the plugin
 		$puc_dir = $this->get_puc_dir();
 		
-		if (!is_readable($puc_dir.'/plugin-update-checker.php') && !class_exists('Puc_v4_Factory')) return;
+		if (!is_readable($puc_dir.'/plugin-update-checker.php') && !class_exists('YahnisElsts\PluginUpdateChecker\v5\PucFactory')) return;
 
 		$options = $this->get_option($this->option_name);
 		
@@ -176,7 +222,7 @@ class Updraft_Manager_Updater_1_8 {
 		
 		if (!$email && $this->require_login) return;
 		
-		// Load the file even if the Puc_v4_Factory class is already around, as this may get us a later version / avoid a really old + incompatible one
+		// Load the file even if the PucFactory class is already around, as this may get us a later version / avoid a really old + incompatible one
 		if (file_exists($puc_dir.'/plugin-update-checker.php')) include_once($puc_dir.'/plugin-update-checker.php');
 		
 		if ($this->auto_backoff) add_filter('puc_check_now-'.$this->slug, array($this, 'puc_check_now'), 10, 3);
@@ -184,8 +230,8 @@ class Updraft_Manager_Updater_1_8 {
 		add_filter('puc_retain_fields-'.$this->slug, array($this, 'puc_retain_fields'));
 		// add_filter('puc_request_info_options-'.$this->slug, array($this, 'puc_request_info_options'));
 
-		if (class_exists('Puc_v4_Factory')) {
-			$this->plug_updatechecker = Puc_v4_Factory::buildUpdateChecker($this->url, WP_PLUGIN_DIR.'/'.$this->relative_plugin_file, $this->slug, $this->interval_hours);
+		if (class_exists('YahnisElsts\PluginUpdateChecker\v5\PucFactory')) {
+			$this->plug_updatechecker = YahnisElsts\PluginUpdateChecker\v5\PucFactory::buildUpdateChecker($this->url, WP_PLUGIN_DIR.'/'.$this->relative_plugin_file, $this->slug, $this->interval_hours);
 			$this->plug_updatechecker->addQueryArgFilter(array($this, 'updater_queryargs_plugin'));
 			if ($this->debug) $this->plug_updatechecker->debugMode = true;
 		}
@@ -662,7 +708,7 @@ class Updraft_Manager_Updater_1_8 {
 		$email = isset($options['email']) ? $options['email'] : '';
 		$duplicate_site = isset($options['was_previously_sharing_licence']) && false === $options['was_previously_sharing_licence'];
 
-		if (empty($this->connector_footer_added)) {
+		if (!$this->connector_footer_added) {
 			$this->connector_footer_added = true;
 			add_action('admin_footer', array($this, 'admin_footer'));
 		}
@@ -992,11 +1038,13 @@ class Updraft_Manager_Updater_1_8 {
 	private function connect() {
 		$options = $this->get_option($this->option_name);
 
-		$result = wp_remote_post($this->url.'&udm_action=claimaddon&slug='.urlencode($this->slug).'&e='.urlencode($_POST['email']),
+		$email = stripslashes($_POST['email']);
+		
+		$result = wp_remote_post($this->url.'&udm_action=claimaddon&slug='.urlencode($this->slug).'&e='.urlencode($email),
 			apply_filters('udmupdater_wp_api_options', array(
 				'timeout' => 10,
 				'body' => array(
-					'e' => $_POST['email'],
+					'e' => $email,
 					'p' => base64_encode($_POST['password']),
 					'sid' => $this->site_id(),
 					'sn' => base64_encode(get_bloginfo('name')),
@@ -1022,7 +1070,7 @@ class Updraft_Manager_Updater_1_8 {
 				if (isset($decoded['code']) && 'OK' == $decoded['code']) {
 					$option = $this->get_option($this->option_name);
 					if (!is_array($option)) $option = array();
-					$option['email'] = $_POST['email'];
+					$option['email'] = $email;
 					$this->update_option($this->option_name, $option);
 					do_action('udmupdater_subscription_activated');
 					
@@ -1055,6 +1103,8 @@ class Updraft_Manager_Updater_1_8 {
 					$this->update_option($this->option_name, $option);
 					$result['body'] = json_encode($decoded);
 				}
+				
+				do_action('udmupdater_connect_result', $decoded, $this, $email);
 
 				echo $result['body'];
 				
@@ -1072,7 +1122,9 @@ class Updraft_Manager_Updater_1_8 {
 					if (class_exists($plugin_update_class) && is_callable(array($plugin_update_class, 'fromObject')) && !empty($this->plug_updatechecker)) {
 
 						// $plugin_update_class::fromObject() is invalid syntax on PHP 5.2
-						$plugin_update = call_user_func(array($plugin_update_class, 'fromObject'), $plugin_info);
+						// Puc_v4pxx_Plugin_Update::fromObject() method (according to its docblock) accepts only object type for its parameter, passing an array produces a PHP fatal error on PHP 8.x, but still works on other PHP versions prior to 8.0
+						// we now that $plugin_info will always be an array and will never be a string, so no need to add a check for that we can just cast it into an object
+						$plugin_update = call_user_func(array($plugin_update_class, 'fromObject'), (object) $plugin_info);
 						
 						$update_checker = $this->plug_updatechecker;
 						
